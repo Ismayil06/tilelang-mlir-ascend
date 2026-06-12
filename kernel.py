@@ -159,6 +159,7 @@ def bwd(
         dQ: T.Tensor(q_shape, dtype),
         dKV: T.Tensor(kv_shape, accum_dtype),
         dAttnSink: T.Tensor(attn_sink_shape, accum_dtype),
+        SparseKVBuffer: T.Tensor([B, S, topk, D], dtype),
     ):
         with T.Kernel(S * B * NH, is_npu=True) as (cid, _):
             s_i = cid % S
@@ -205,11 +206,15 @@ def bwd(
                 T.clear(KV_shared)
                 for h_i, bi_i in T.Parallel(block_H, BS):
                     acc_p[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, acc_p_inf)
+
+                KV_gather = T.alloc_shared([BS, D], dtype)
                 for i in T.serial(BS):
                     cur_idx = idxs[i]
                     if cur_idx != -1:
-                        T.copy(KV[by, cur_idx, 0:D],  KV_shared[i, 0:D])
-                T.vadd(KV_shared, 0.0, KV_shared)
+                        T.copy(KV[by, cur_idx, 0:D],  KV_gather[i, :D])
+                T.copy(KV_gather, SparseKVBuffer[by, s_i, i_i * BS : (i_i + 1) * BS, 0:D])
+                T.copy(SparseKVBuffer[by, s_i, i_i * BS : (i_i + 1) * BS, 0:D], KV_shared)
+
                 T.gemm(Q_shared, KV_shared, acc_p, b_transpose=True)
 
                 # P = exp2(scores * sm_scale_log2e - LSE)
@@ -301,7 +306,7 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale):
     d_attn_sink = torch.zeros_like(attn_sink)
     dq = torch.zeros_like(q, dtype=torch.bfloat16)
     SparseKVBuffer = torch.empty((B, S, topk, D), device=q.device, dtype=torch.bfloat16)
-    bwd_kernel(q, kv, do, attn_sink, topk_idxs, lse, delta, dq, dkv, d_attn_sink)
+    bwd_kernel(q, kv, do, attn_sink, topk_idxs, lse, delta, dq, dkv, d_attn_sink, SparseKVBuffer)
 
     dkv = postprocess_kernel(dkv)
 
