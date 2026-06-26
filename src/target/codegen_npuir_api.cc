@@ -512,6 +512,10 @@ CodeGenTileLangNPUIRAPI::GetHIVMAddressSpace(String address_space) {
     return mlir::hivm::AddressSpace::UB;
   else if (address_space == "shared.dyn")
     return mlir::hivm::AddressSpace::L1;
+  else if (address_space == "wmma.matrix_a")
+    return mlir::hivm::AddressSpace::L0A;
+  else if (address_space == "wmma.matrix_b")
+    return mlir::hivm::AddressSpace::L0B;
   else if (address_space == "wmma.accumulator")
     return mlir::hivm::AddressSpace::L0C;
   return mlir::hivm::AddressSpace::Zero;
@@ -2472,8 +2476,15 @@ void CodeGenTileLangNPUIRAPI::VisitStmt_(const AllocateNode *op) {
   std::map<std::string, NPU_CORETYPE> scope_coretype_map{
       {"shared", NPU_CORETYPE::AIV},
       {"shared.dyn", NPU_CORETYPE::AIC},
-      {"wmma.accumulator", NPU_CORETYPE::AIC}};
-  if (scope_coretype_map[scope] == this->current_coretype) {
+      {"wmma.accumulator", NPU_CORETYPE::AIC},
+      {"wmma.matrix_a", NPU_CORETYPE::AIC},
+      {"wmma.matrix_b", NPU_CORETYPE::AIC}};
+  auto scope_it = scope_coretype_map.find(scope);
+  bool should_allocate =
+      this->func_coretype != NPU_CORETYPE::MIX ||
+      scope_it == scope_coretype_map.end() ||
+      scope_it->second == this->current_coretype;
+  if (should_allocate) {
     std::vector<long int> shape = GetShape(op->extents);
     std::vector<int64_t> strides = GetStrideFromShapeAPI(op->extents);
 

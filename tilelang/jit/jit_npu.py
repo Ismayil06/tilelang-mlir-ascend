@@ -1416,10 +1416,10 @@ class compiler_npu:
             ]
 
             TILELANG_ASCEND_MODE = os.environ.get('TILELANG_ASCEND_MODE')
-            if TILELANG_ASCEND_MODE is None:
-                _compile_option_list.append("--disable-hivm-tensor-compile=true")
-            elif TILELANG_ASCEND_MODE.lower().strip() in ['expert', 'exp', 'e']:
-                _compile_option_list.append("--disable-hivm-tensor-compile=true")
+            # if TILELANG_ASCEND_MODE is None:
+            #     _compile_option_list.append("--disable-hivm-tensor-compile=true")
+            # elif TILELANG_ASCEND_MODE.lower().strip() in ['expert', 'exp', 'e']:
+            #     _compile_option_list.append("--disable-hivm-tensor-compile=true")
 
             # Add 910_95/950 specific compile options
             arch = NPUUtils().get_arch()
