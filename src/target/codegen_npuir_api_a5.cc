@@ -614,8 +614,8 @@ CodeGenTileLangNPUIRAPIA5::CodeGenTileLangNPUIRAPIA5() : builder(&context) {
   this->context
       .loadDialect<mlir::func::FuncDialect, mlir::arith::ArithDialect,
                    mlir::linalg::LinalgDialect, mlir::scf::SCFDialect,
-                   mlir::memref::MemRefDialect, mlir::hivm::HIVMDialect,
-                   mlir::hfusion::HFusionDialect,
+                   mlir::memref::MemRefDialect, mlir::tensor::TensorDialect,
+                   mlir::hivm::HIVMDialect, mlir::hfusion::HFusionDialect,
                    mlir::bufferization::BufferizationDialect>();
   // Create MLIR module
   this->module = ModuleOp::create(UnknownLoc::get(&this->context));
@@ -1391,6 +1391,8 @@ void CodeGenTileLangNPUIRAPIA5::UnaryVecOpCodegen(const CallNode *op) {
 
 namespace {
 
+using ReassociationIndices = llvm::SmallVector<int64_t, 2>;
+
 void CreateLinalgBinary(mlir::OpBuilder &builder, mlir::Location loc,
                         mlir::linalg::BinaryFn fn, mlir::Value lhs,
                         mlir::Value rhs, mlir::Value dst) {
@@ -1482,71 +1484,175 @@ void MaybeBroadcastBinaryOperand(mlir::OpBuilder &builder, mlir::Location loc,
   src = BroadcastMemref(builder, loc, src, dst, broadcastDims);
 }
 
-using ReassociationIndices = llvm::SmallVector<int64_t, 2>;
+static bool isContiguousMemref(mlir::MemRefType ty) {
+  if (ty.getLayout().isIdentity())
+    return true;
+
+  llvm::SmallVector<int64_t> strides;
+  int64_t offset = 0;
+  if (mlir::failed(mlir::getStridesAndOffset(ty, strides, offset)))
+    return false;
+  if (offset != 0 && offset != mlir::ShapedType::kDynamic)
+    return false;
+
+  int64_t expected = 1;
+  auto shape = ty.getShape();
+  for (int64_t i = static_cast<int64_t>(shape.size()) - 1; i >= 0; --i) {
+    if (shape[i] == 0)
+      continue;
+    if (strides[i] != mlir::ShapedType::kDynamic && strides[i] != expected)
+      return false;
+    if (shape[i] == mlir::ShapedType::kDynamic) {
+      expected = mlir::ShapedType::kDynamic;
+    } else if (expected != mlir::ShapedType::kDynamic) {
+      expected *= shape[i];
+    }
+  }
+  return true;
+}
+
+// OneShotBufferize of outlined vector functions expects default-space
+// contiguous memrefs. UB / strided sources cannot be cast into those
+// signatures (see CallOp::bufferize assert). Match reduce_dev.mlir: copy into
+// a plain memref before bufferization.to_tensor.
+static mlir::Value ensureDefaultSpaceContiguousMemref(mlir::OpBuilder &builder,
+                                                      mlir::Location loc,
+                                                      mlir::Value src) {
+  auto srcTy = src.getType().cast<mlir::MemRefType>();
+  auto dstTy = mlir::MemRefType::get(srcTy.getShape(), srcTy.getElementType());
+  if (srcTy == dstTy && isContiguousMemref(srcTy))
+    return src;
+
+  mlir::Value tmp = builder.create<mlir::memref::AllocOp>(loc, dstTy);
+  builder.create<mlir::memref::CopyOp>(loc, src, tmp);
+  return tmp;
+}
 
 static mlir::Value toTensorValue(mlir::OpBuilder &builder, mlir::Location loc,
                                  mlir::Value value) {
-  if (value.getType().isa<mlir::RankedTensorType>()) {
+  if (value.getType().isa<mlir::RankedTensorType>())
     return value;
-  }
 
   auto memRefTy = value.getType().cast<mlir::MemRefType>();
   auto tensorTy = mlir::RankedTensorType::get(memRefTy.getShape(),
                                               memRefTy.getElementType());
   return builder
       .create<mlir::bufferization::ToTensorOp>(
-          loc, tensorTy, value, builder.getUnitAttr(), mlir::UnitAttr())
+          loc, tensorTy, value, /*restrict=*/builder.getUnitAttr(),
+          /*writable=*/mlir::UnitAttr())
       .getResult();
 }
 
 mlir::FailureOr<mlir::Value>
-squeezeTensorDims(mlir::OpBuilder &builder, mlir::Location loc,
-                  mlir::Value operand, llvm::SmallVector<int64_t> &dimensions) {
-  auto operandTy = llvm::dyn_cast<mlir::RankedTensorType>(operand.getType());
-  if (!operandTy)
+unsqueezeTensorDims(mlir::OpBuilder &builder, mlir::Location loc,
+                    mlir::Value operand,
+                    llvm::SmallVector<int64_t> &dimensions) {
+  auto operandType = llvm::dyn_cast<mlir::RankedTensorType>(operand.getType());
+  if (!operandType)
     return mlir::failure();
 
-  llvm::ArrayRef<int64_t> operandShape = operandTy.getShape();
-  llvm::SmallVector<ReassociationIndices> reassociation;
+  llvm::SmallVector<int64_t> operandShape(operandType.getShape());
   llvm::DenseSet<int64_t> dimSet(dimensions.begin(), dimensions.end());
 
-  int64_t resultRank = static_cast<int64_t>(operandShape.size()) -
-                       static_cast<int64_t>(dimensions.size());
-  if (resultRank == 0) {
-    auto newOperandType =
-        mlir::RankedTensorType::get({}, operandTy.getElementType());
-    return builder
-        .create<mlir::tensor::CollapseShapeOp>(loc, newOperandType, operand,
-                                               reassociation)
-        .getResult();
-  }
-
-  reassociation.resize(resultRank);
-  int64_t idx = -1;
-  for (size_t i = 0; i < operandShape.size(); ++i) {
-    if (!dimSet.contains(static_cast<int64_t>(i))) {
-      ++idx;
+  llvm::SmallVector<int64_t> resultShape;
+  size_t operandIdx = 0;
+  for (size_t i = 0; i < operandShape.size() + dimensions.size(); ++i) {
+    if (dimSet.contains(static_cast<int64_t>(i))) {
+      resultShape.push_back(1);
     } else {
-      assert((operandShape[i] == mlir::ShapedType::kDynamic ||
-              operandShape[i] == 1) &&
-             "Only squeeze dim=1!");
-    }
-    reassociation[std::max<int64_t>(idx, 0)].push_back(i);
-  }
-
-  llvm::SmallVector<int64_t> newOperandShape;
-  for (size_t i = 0; i < operandShape.size(); ++i) {
-    if (!dimSet.contains(static_cast<int64_t>(i))) {
-      newOperandShape.push_back(operandShape[i]);
+      if (operandIdx >= operandShape.size())
+        return mlir::failure();
+      resultShape.push_back(operandShape[operandIdx++]);
     }
   }
 
-  auto newOperandType =
-      mlir::RankedTensorType::get(newOperandShape, operandTy.getElementType());
+  auto resultType =
+      mlir::RankedTensorType::get(resultShape, operandType.getElementType());
+
+  // tensor.expand_shape cannot expand a 0-D (scalar) tensor; splat instead.
+  if (operandShape.empty()) {
+    auto scalar = builder.create<mlir::tensor::ExtractOp>(loc, operand,
+                                                          mlir::ValueRange{});
+    auto empty = builder.create<mlir::tensor::EmptyOp>(
+        loc, resultShape, operandType.getElementType());
+    return builder
+        .create<mlir::linalg::FillOp>(loc, mlir::ValueRange{scalar},
+                                      mlir::ValueRange{empty})
+        .getResult(0);
+  }
+
+  llvm::SmallVector<ReassociationIndices> reassociation(operandShape.size());
+  int64_t idx = -1;
+  for (size_t i = 0; i < operandShape.size() + dimensions.size(); ++i) {
+    if (!dimSet.contains(static_cast<int64_t>(i)))
+      ++idx;
+    reassociation[std::max<int64_t>(idx, 0)].push_back(static_cast<int64_t>(i));
+  }
+
   return builder
-      .create<mlir::tensor::CollapseShapeOp>(loc, newOperandType, operand,
-                                             reassociation)
+      .create<mlir::tensor::ExpandShapeOp>(loc, resultType, operand,
+                                           reassociation)
       .getResult();
+}
+
+static mlir::Value makeReduceInitValue(mlir::OpBuilder &builder,
+                                       mlir::Location loc, mlir::Type elemTy,
+                                       const std::string &reduce_mode) {
+  if (reduce_mode == "sum" || reduce_mode == "any" || reduce_mode == "ori" ||
+      reduce_mode == "xori" || reduce_mode == "none") {
+    return builder.create<mlir::arith::ConstantOp>(loc, elemTy,
+                                                   builder.getZeroAttr(elemTy));
+  }
+  if (reduce_mode == "prod") {
+    return builder.create<mlir::arith::ConstantOp>(loc, elemTy,
+                                                   builder.getOneAttr(elemTy));
+  }
+  if (reduce_mode == "max") {
+    if (auto floatTy = elemTy.dyn_cast<mlir::FloatType>()) {
+      return builder.create<mlir::arith::ConstantOp>(
+          loc, elemTy,
+          builder.getFloatAttr(
+              floatTy, llvm::APFloat::getInf(floatTy.getFloatSemantics(),
+                                             /*Neg=*/true)));
+    }
+    if (auto intTy = elemTy.dyn_cast<mlir::IntegerType>()) {
+      return builder.create<mlir::arith::ConstantOp>(
+          loc, elemTy,
+          builder.getIntegerAttr(intTy,
+                                 llvm::APInt::getMinValue(intTy.getWidth())));
+    }
+    return builder.create<mlir::arith::ConstantOp>(loc, elemTy,
+                                                   builder.getZeroAttr(elemTy));
+  }
+  if (reduce_mode == "min") {
+    if (auto floatTy = elemTy.dyn_cast<mlir::FloatType>()) {
+      return builder.create<mlir::arith::ConstantOp>(
+          loc, elemTy,
+          builder.getFloatAttr(
+              floatTy, llvm::APFloat::getInf(floatTy.getFloatSemantics(),
+                                             /*Neg=*/false)));
+    }
+    if (auto intTy = elemTy.dyn_cast<mlir::IntegerType>()) {
+      return builder.create<mlir::arith::ConstantOp>(
+          loc, elemTy,
+          builder.getIntegerAttr(intTy,
+                                 llvm::APInt::getMaxValue(intTy.getWidth())));
+    }
+    return builder.create<mlir::arith::ConstantOp>(loc, elemTy,
+                                                   builder.getZeroAttr(elemTy));
+  }
+  if (reduce_mode == "all") {
+    if (auto intTy = elemTy.dyn_cast<mlir::IntegerType>()) {
+      return builder.create<mlir::arith::ConstantOp>(
+          loc, elemTy,
+          builder.getIntegerAttr(intTy,
+                                 llvm::APInt::getAllOnes(intTy.getWidth())));
+    }
+    return builder.create<mlir::arith::ConstantOp>(loc, elemTy,
+                                                   builder.getZeroAttr(elemTy));
+  }
+  return builder.create<mlir::arith::ConstantOp>(loc, elemTy,
+                                                 builder.getZeroAttr(elemTy));
 }
 
 } // namespace
@@ -1554,26 +1660,62 @@ squeezeTensorDims(mlir::OpBuilder &builder, mlir::Location loc,
 void CodeGenTileLangNPUIRAPIA5::VreduceCodegen(const CallNode *op) {
   tvm::tl::NpuirReduce npuirop(op->args, this->vmap);
 
-  mlir::Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
-  mlir::Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  mlir::Value srcMem = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
+  mlir::Value dstMem = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
 
   auto loc = builder.getUnknownLoc();
-  src = toTensorValue(builder, loc, src);
-  dst = toTensorValue(builder, loc, dst);
-  auto elemTy = getElementTypeOrSelf(src.getType());
+  srcMem = ensureDefaultSpaceContiguousMemref(builder, loc, srcMem);
 
-  llvm::SmallVector<int64_t> squeezeDimsList(npuirop.reduce_dims.begin(),
-                                             npuirop.reduce_dims.end());
+  mlir::Value src = toTensorValue(builder, loc, srcMem);
+  auto srcTy = src.getType().cast<mlir::RankedTensorType>();
+  auto elemTy = srcTy.getElementType();
+  auto srcShape = srcTy.getShape();
 
-  mlir::Value squeezedInit = dst;
-  if (!squeezeDimsList.empty()) {
-    auto squeezed = squeezeTensorDims(builder, loc, dst, squeezeDimsList);
-    if (mlir::failed(squeezed)) {
-      mlir::emitError(loc, "squeeze failed");
-      return;
-    }
-    squeezedInit = *squeezed;
+  llvm::DenseSet<int64_t> reduceDimSet(npuirop.reduce_dims.begin(),
+                                       npuirop.reduce_dims.end());
+  llvm::SmallVector<int64_t> naturalReduceShape;
+  for (int64_t i = 0, e = srcTy.getRank(); i < e; ++i) {
+    if (!reduceDimSet.contains(i))
+      naturalReduceShape.push_back(srcShape[i]);
   }
+
+  auto dstMemTy = dstMem.getType().cast<mlir::MemRefType>();
+  auto dstShape = dstMemTy.getShape();
+  int dstRank = dstMemTy.getRank();
+  int numReduceDims = static_cast<int>(npuirop.reduce_dims.size());
+
+  llvm::SmallVector<int64_t> squeezeDimsList;
+  if (dstRank == static_cast<int>(naturalReduceShape.size()) + numReduceDims) {
+    bool valid = true;
+    for (int64_t dim : npuirop.reduce_dims) {
+      if (dim < 0 || dim >= dstRank || dstShape[dim] != 1) {
+        valid = false;
+        break;
+      }
+    }
+    if (valid)
+      squeezeDimsList.assign(npuirop.reduce_dims.begin(),
+                             npuirop.reduce_dims.end());
+  }
+
+  llvm::SmallVector<int64_t> squeezedInitShape = naturalReduceShape;
+  if (squeezeDimsList.empty() &&
+      static_cast<int>(dstShape.size()) ==
+          static_cast<int>(naturalReduceShape.size())) {
+    squeezedInitShape.assign(dstShape.begin(), dstShape.end());
+  }
+
+  // Use a filled tensor.empty init instead of to_tensor(dst). That avoids
+  // collapsing the destination memref and losing UB address space before store.
+  mlir::Value initScalar =
+      makeReduceInitValue(builder, loc, elemTy, npuirop.reduce_mode);
+  mlir::Value emptyInit =
+      builder.create<mlir::tensor::EmptyOp>(loc, squeezedInitShape, elemTy);
+  mlir::Value squeezedInit =
+      builder
+          .create<mlir::linalg::FillOp>(loc, mlir::ValueRange{initScalar},
+                                        mlir::ValueRange{emptyInit})
+          .getResult(0);
 
   auto reduceOp = builder.create<mlir::linalg::ReduceOp>(
       loc, mlir::TypeRange{squeezedInit.getType()}, mlir::ValueRange{src},
@@ -1680,6 +1822,21 @@ void CodeGenTileLangNPUIRAPIA5::VreduceCodegen(const CallNode *op) {
 
     builder.create<mlir::linalg::YieldOp>(loc, result);
   }
+
+  mlir::Value reducedResult = reduceOp.getResult(0);
+  if (!squeezeDimsList.empty()) {
+    auto unsqueezed =
+        unsqueezeTensorDims(builder, loc, reducedResult, squeezeDimsList);
+    if (mlir::failed(unsqueezed)) {
+      mlir::emitError(loc, "unsqueeze failed");
+      return;
+    }
+    reducedResult = *unsqueezed;
+  }
+
+  auto matOp = builder.create<mlir::bufferization::MaterializeInDestinationOp>(
+      loc, reducedResult, dstMem);
+  matOp.setWritable(true);
 }
 
 void CodeGenTileLangNPUIRAPIA5::VcosCodegen(const CallNode *op) {
