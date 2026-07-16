@@ -1839,6 +1839,119 @@ void CodeGenTileLangNPUIRAPIA5::VreduceCodegen(const CallNode *op) {
   matOp.setWritable(true);
 }
 
+// Expert memref pow must use tensor SSA so HFusion NormalizePowf can rewrite
+// f16/f32 (memref powf expands to illegal vector fpow on A5).
+void CodeGenTileLangNPUIRAPIA5::VpowCodegen(const CallNode *op) {
+  const CallNode *region_node_dst = op->args[2].as<CallNode>();
+  ICHECK(region_node_dst) << "npuir_pow destination must be a region";
+  const BufferLoadNode *buffer_load_node_dst =
+      region_node_dst->args[0].as<BufferLoadNode>();
+  ICHECK(buffer_load_node_dst)
+      << "npuir_pow destination region must wrap a BufferLoad";
+  DataType dst_dtype = buffer_load_node_dst->buffer->dtype;
+
+  auto processImm = [&](mlir::Value &src, int arg_id,
+                        Array<PrimExpr> &buffer_shape) {
+    if (op->args[arg_id].as<IntImm>() || op->args[arg_id].as<FloatImm>() ||
+        op->args[arg_id].as<tir::VarNode>()) {
+      const CallNode *region_node = op->args[1 - arg_id].as<CallNode>();
+      DataType target_dtype = dst_dtype;
+      if (region_node) {
+        if (const auto *buffer_load_node =
+                region_node->args[0].as<BufferLoadNode>()) {
+          target_dtype = buffer_load_node->buffer->dtype;
+        }
+      }
+      if (op->args[arg_id]->dtype != target_dtype) {
+        src = ScalarConvertType(op->args[arg_id], target_dtype);
+      } else {
+        src = MakeValue(op->args[arg_id]);
+      }
+    } else {
+      const CallNode *region_node = op->args[arg_id].as<CallNode>();
+      ICHECK(region_node) << "npuir_pow operand must be a scalar or region";
+      auto buffer_node = region_node->args[0].as<BufferLoadNode>();
+      buffer_shape = buffer_node->buffer->shape;
+      bool is_scalar_load = true;
+      for (int i = 0; i < buffer_shape.size(); i++) {
+        const IntImmNode *int_imm = region_node->args[2 + i].as<IntImmNode>();
+        if (!int_imm || int_imm->value != 1) {
+          is_scalar_load = false;
+          break;
+        }
+      }
+      if (is_scalar_load && arg_id == 1) {
+        src = GenMemrefLoadFromRegion(buffer_node);
+        buffer_shape.clear();
+      } else {
+        src = GenSubviewFromRegion(region_node);
+      }
+    }
+  };
+
+  mlir::Value src0, src1;
+  Array<PrimExpr> buffer_shape0, buffer_shape1;
+  processImm(src0, 0, buffer_shape0);
+  processImm(src1, 1, buffer_shape1);
+  mlir::Value dst = GenSubviewFromRegion(region_node_dst);
+
+  ArrayRef<int64_t> shape;
+  if (auto shapedType = dst.getType().dyn_cast<ShapedType>()) {
+    shape = shapedType.getShape();
+  }
+  auto dims0 = getBroadcastDim(buffer_shape0, shape);
+  auto dims1 = getBroadcastDim(buffer_shape1, shape);
+
+  auto loc = builder.getUnknownLoc();
+  MaybeBroadcastBinaryOperand(builder, loc, src0, dst, dims0);
+  MaybeBroadcastBinaryOperand(builder, loc, src1, dst, dims1);
+
+  auto dstMemTy = dst.getType().cast<mlir::MemRefType>();
+  auto elemTy = dstMemTy.getElementType();
+  auto dstShape = dstMemTy.getShape();
+
+  llvm::SmallVector<mlir::Value> dynamicSizes;
+  for (int64_t i = 0; i < dstMemTy.getRank(); ++i) {
+    if (dstMemTy.isDynamicDim(i)) {
+      dynamicSizes.push_back(builder.create<mlir::memref::DimOp>(loc, dst, i));
+    }
+  }
+
+  auto toTensorOperand = [&](mlir::Value v) -> mlir::Value {
+    if (v.getType().isa<mlir::MemRefType>()) {
+      mlir::Value contig = ensureDefaultSpaceContiguousMemref(builder, loc, v);
+      return toTensorValue(builder, loc, contig);
+    }
+    auto empty = builder.create<mlir::tensor::EmptyOp>(loc, dstShape, elemTy,
+                                                       dynamicSizes);
+    return builder
+        .create<mlir::linalg::FillOp>(loc, mlir::ValueRange{v},
+                                      mlir::ValueRange{empty})
+        .getResult(0);
+  };
+
+  mlir::Value t0 = toTensorOperand(src0);
+  mlir::Value t1 = toTensorOperand(src1);
+  mlir::Value outInit = builder.create<mlir::tensor::EmptyOp>(
+      loc, dstShape, elemTy, dynamicSizes);
+
+  hfusion::BinaryFn fn = elemTy.isa<mlir::FloatType>()
+                             ? hfusion::BinaryFn::powf
+                             : hfusion::BinaryFn::powi;
+  mlir::Value result =
+      builder
+          .create<hfusion::ElemwiseBinaryOp>(
+              loc, outInit.getType(), mlir::ValueRange{t0, t1},
+              mlir::ValueRange{outInit},
+              mlir::ArrayRef{builder.getNamedAttr(
+                  "fun", builder.getAttr<hfusion::BinaryFnAttr>(fn))})
+          .getResult(0);
+
+  auto matOp = builder.create<mlir::bufferization::MaterializeInDestinationOp>(
+      loc, result, dst);
+  matOp.setWritable(true);
+}
+
 void CodeGenTileLangNPUIRAPIA5::VcosCodegen(const CallNode *op) {
   tvm::tl::NpuirVCos npuirop(op->args, this->vmap);
   auto loc = builder.getUnknownLoc();
@@ -2991,8 +3104,7 @@ mlir::Value CodeGenTileLangNPUIRAPIA5::VisitExpr_(const CallNode *op) {
   } else if (op->op.same_as(Op::Get("tl.npuir_xor"))) {
     CreateHIVMBinaryVectorOp<ElemwiseOp<hfusion::BinaryFn::vxor>>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_pow"))) {
-    CreateHIVMBinaryVectorOp<ElemwiseOp<hfusion::BinaryFn::powf>,
-                             ElemwiseOp<hfusion::BinaryFn::powi>>(op);
+    VpowCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_shl"))) {
     CreateHIVMBinaryVectorOp<void, ElemwiseOp<hfusion::BinaryFn::shli>>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_shr"))) {

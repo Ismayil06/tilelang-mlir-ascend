@@ -230,6 +230,7 @@ private:
   void VbrcCodegen(const CallNode *op);
   void VcastCodegen(const CallNode *op);
   void VreduceCodegen(const CallNode *op);
+  void VpowCodegen(const CallNode *op);
   void VsigmoidCodegen(const CallNode *op);
   void VcosCodegen(const CallNode *op);
   void VsinCodegen(const CallNode *op);
