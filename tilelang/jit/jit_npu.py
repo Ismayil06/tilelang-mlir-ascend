@@ -5,7 +5,7 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Mapping, Union
 import torch
 from ..engine import lower
 from ..utils import (
@@ -25,6 +25,93 @@ from tvm import transform
 
 from tilelang.profiler import Profiler, TensorSupplyType
 from tilelang.transform.pass_config import normalize_pass_configs
+
+
+_VALID_VF_FUSION_MODES = {
+    "all-op",
+    "n-most-op",
+    "max-parallel",
+    "ub-aware-op",
+}
+
+
+def _build_npu_compile_options(pass_configs: Mapping[str, Any]) -> List[str]:
+    """Translate TileLang NPUIR pass configs to bishengir-compile options."""
+    enable_auto_multi_buffer = pass_configs.get(
+        "npuir.enable_auto_multi_buffer",
+        True,
+    )
+    disable_hivm_auto_inject_sync = pass_configs.get(
+        "npuir.disable_hivm_auto_inject_sync",
+        False,
+    )
+    enable_vf_fusion = pass_configs.get(
+        "npuir.enable_vf_fusion",
+        False,
+    )
+    vf_fusion_mode = pass_configs.get(
+        "npuir.vf_fusion_mode",
+        "max-parallel",
+    )
+    enable_vf_stack_limit = pass_configs.get(
+        "npuir.enable_vf_stack_limit",
+        False,
+    )
+    enable_vf_merge_level = pass_configs.get(
+        "npuir.enable_vf_merge_level",
+        1,
+    )
+    simt_vf_dynamic_size = pass_configs.get(
+        "npuir.simt_vf_dynamic_size",
+        216,
+    )
+
+    if vf_fusion_mode not in _VALID_VF_FUSION_MODES:
+        valid_modes = ", ".join(sorted(_VALID_VF_FUSION_MODES))
+        raise ValueError(
+            f"Invalid npuir.vf_fusion_mode {vf_fusion_mode!r}; "
+            f"expected one of: {valid_modes}"
+        )
+    if (
+        not isinstance(enable_vf_merge_level, int)
+        or isinstance(enable_vf_merge_level, bool)
+        or enable_vf_merge_level not in (0, 1, 2)
+    ):
+        raise ValueError(
+            "Invalid npuir.enable_vf_merge_level "
+            f"{enable_vf_merge_level!r}; expected 0, 1, or 2"
+        )
+    if (
+        not isinstance(simt_vf_dynamic_size, int)
+        or isinstance(simt_vf_dynamic_size, bool)
+        or simt_vf_dynamic_size <= 0
+    ):
+        raise ValueError(
+            "Invalid npuir.simt_vf_dynamic_size "
+            f"{simt_vf_dynamic_size!r}; expected a positive integer in KB"
+        )
+
+    return [
+        f"--enable-auto-multi-buffer={str(enable_auto_multi_buffer).lower()}",
+        (
+            "--disable-hivm-auto-inject-sync="
+            f"{str(disable_hivm_auto_inject_sync).lower()}"
+        ),
+        f"--enable-vf-fusion={str(enable_vf_fusion).lower()}",
+        f"--vf-fusion-mode={vf_fusion_mode}",
+        f"--enable-vf-stack-limit={str(enable_vf_stack_limit).lower()}",
+        f"--enable-vf-merge-level={enable_vf_merge_level}",
+        f"--simt-vf-dynamic-size={simt_vf_dynamic_size}",
+    ]
+
+
+def _get_tvm_pass_configs(pass_configs: Mapping[str, Any]) -> Dict[str, Any]:
+    """Remove NPUIR backend options before constructing TVM's PassContext."""
+    return {
+        key: value
+        for key, value in pass_configs.items()
+        if not str(getattr(key, "value", key)).startswith("npuir.")
+    }
 
 
 class LaunchThreadExtractor:
@@ -1178,7 +1265,8 @@ class compiler_npu:
             pass_configs = {}
         # Store pass_configs for later use in NPU compilation
         self.pass_configs = normalize_pass_configs(pass_configs)
-        with transform.PassContext(opt_level=3, config=pass_configs):
+        tvm_pass_configs = _get_tvm_pass_configs(self.pass_configs)
+        with transform.PassContext(opt_level=3, config=tvm_pass_configs):
             mlir_path = lower(self.mod)
         if mlir_path.endswith(".mlir"):
             self.mlir_content = self._read_mlir_file(mlir_path)
@@ -1459,29 +1547,9 @@ class compiler_npu:
             # TileLang Ascend JIT Runtime now follows Triton JIT style.
             # bishengir-compile --enable-triton-kernel-compile=true make sure the way.
 
-            # Build compile options with pass_configs support
-            _compile_option_list = []
-
             # Get configuration from pass_configs with default values
             pass_configs = getattr(self, "pass_configs", {})
-
-            # Handle --enable-auto-multi-buffer option
-            enable_auto_multi_buffer = pass_configs.get(
-                "npuir.enable_auto_multi_buffer",
-                True,  # Default: enabled
-            )
-            _compile_option_list.append(
-                f"--enable-auto-multi-buffer={str(enable_auto_multi_buffer).lower()}"
-            )
-
-            # Handle --disable-hivm-auto-inject-sync option
-            disable_hivm_auto_inject_sync = pass_configs.get(
-                "npuir.disable_hivm_auto_inject_sync",
-                False,  # Default: enabled
-            )
-            _compile_option_list.append(
-                f"--disable-hivm-auto-inject-sync={str(disable_hivm_auto_inject_sync).lower()}"
-            )
+            _compile_option_list = _build_npu_compile_options(pass_configs)
 
             _compile_option_list.append("--enable-triton-kernel-compile=true")
 

@@ -42,6 +42,21 @@ class PassConfigKey(str, Enum):
     NPUIR_DISABLE_HIVM_AUTO_INJECT_SYNC = "npuir.disable_hivm_auto_inject_sync"
     """Disable automatic inner core synchronization injection. Default: False"""
 
+    NPUIR_ENABLE_VF_FUSION = "npuir.enable_vf_fusion"
+    """Enable BishengIR vector-function fusion. Default: False"""
+
+    NPUIR_VF_FUSION_MODE = "npuir.vf_fusion_mode"
+    """Select the VF fusion strategy. Default: max-parallel"""
+
+    NPUIR_ENABLE_VF_STACK_LIMIT = "npuir.enable_vf_stack_limit"
+    """Enable conservative vector-function stack slot limits. Default: False"""
+
+    NPUIR_ENABLE_VF_MERGE_LEVEL = "npuir.enable_vf_merge_level"
+    """Set VF merge level (0-2). Default: 1"""
+
+    NPUIR_SIMT_VF_DYNAMIC_SIZE = "npuir.simt_vf_dynamic_size"
+    """Set the SIMT/MIX vector-function UB budget in KB. Default: 216"""
+
     TL_ENABLE_PLAN_AND_UPDATE_BUFFER_ALLOCATION = (
         "tl.enable_plan_and_update_buffer_allocation"
     )
