@@ -2536,13 +2536,31 @@ void CodeGenTileLangNPUIRAPIA5::Nd2NzCodegen(const CallNode *op) {
 void CodeGenTileLangNPUIRAPIA5::Nz2NdCodegen(const CallNode *op) {
   // Generate hivm.hir.nz2nd for tl.npuir_store_nz2nd.
   tvm::tl::NpuirNz2nd npuirop(op->args, this->vmap);
-  // gen memref.subview
+  mlir::Location unknown_loc = builder.getUnknownLoc();
   mlir::Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
-  mlir::Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  src = toTensorValue(builder, unknown_loc, src);
 
-  // gen hivm.hir.nz2nd
-  builder.create<mlir::hivm::NZ2NDOp>(builder.getUnknownLoc(),
-                                      mlir::TypeRange{}, src, dst);
+  mlir::Value dst_val = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  mlir::Value dst_tensor;
+  if (auto memref_type = dst_val.getType().dyn_cast<mlir::MemRefType>()) {
+    auto tensor_type = mlir::RankedTensorType::get(
+        memref_type.getShape(), memref_type.getElementType());
+    dst_tensor = builder
+                     .create<mlir::bufferization::ToTensorOp>(
+                         unknown_loc, tensor_type, dst_val,
+                         /*restrict=*/builder.getUnitAttr(),
+                         /*writable=*/builder.getUnitAttr())
+                     .getResult();
+  } else if (dst_val.getType().isa<mlir::RankedTensorType>()) {
+    dst_tensor = dst_val;
+  } else {
+    LOG(FATAL) << "Unexpected destination type in Nz2NdCodegen";
+  }
+  auto dst_tensor_type = dst_tensor.getType().cast<mlir::RankedTensorType>();
+
+  auto nz2nd = builder.create<mlir::hivm::NZ2NDOp>(
+      unknown_loc, mlir::TypeRange{dst_tensor_type}, src, dst_tensor);
+  var_map_[npuirop.dst->data.get()] = nz2nd->getResult(0);
 }
 
 void CodeGenTileLangNPUIRAPIA5::FixpipeCodegen(const CallNode *op) {
@@ -2615,11 +2633,27 @@ void CodeGenTileLangNPUIRAPIA5::DotCodegen(const CallNode *op) {
   }
 
   mlir::Location unknown_loc = builder.getUnknownLoc();
-  mlir::IndexType idx_ty = builder.getIndexType();
+  // Keep the L1 inputs as memrefs. Only tensorize the L0C output so MmadL1
+  // uses its result-producing tensor form.
   mlir::Value a = GetVarValue(npuirop.src0->data.get());
   mlir::Value b = GetVarValue(npuirop.src1->data.get());
-  mlir::Value c = GetVarValue(npuirop.dst->data.get());
-  mlir::TypeRange result_tensors = {};
+  mlir::Value c_val = GetVarValue(npuirop.dst->data.get());
+  mlir::Value c_tensor;
+  if (auto memref_type = c_val.getType().dyn_cast<mlir::MemRefType>()) {
+    auto tensor_type = mlir::RankedTensorType::get(
+        memref_type.getShape(), memref_type.getElementType());
+    c_tensor = builder
+                   .create<mlir::bufferization::ToTensorOp>(
+                       unknown_loc, tensor_type, c_val,
+                       /*restrict=*/builder.getUnitAttr(),
+                       /*writable=*/builder.getUnitAttr())
+                   .getResult();
+  } else if (c_val.getType().isa<mlir::RankedTensorType>()) {
+    c_tensor = c_val;
+  } else {
+    LOG(FATAL) << "Unexpected destination type in DotCodegen";
+  }
+  auto c_tensor_type = c_tensor.getType().cast<mlir::RankedTensorType>();
   mlir::Value init_condition = MakeValue(npuirop.initC);
   mlir::Value real_m = CreateIndexCastOp(MakeValue(a_region_shape[0]));
   mlir::Value real_k = CreateIndexCastOp(MakeValue(b_region_shape[0]));
@@ -2630,9 +2664,11 @@ void CodeGenTileLangNPUIRAPIA5::DotCodegen(const CallNode *op) {
   mlir::UnitAttr b_transpose =
       npuirop.b_transpose ? builder.getUnitAttr() : mlir::UnitAttr();
   mlir::UnitAttr enable_HF32 = mlir::UnitAttr();
-  builder.create<mlir::hivm::MmadL1Op>(
-      unknown_loc, result_tensors, a, b, init_condition, real_m, real_k, real_n,
-      c, per_channel_bias, a_transpose, b_transpose, enable_HF32);
+  auto mma = builder.create<mlir::hivm::MmadL1Op>(
+      unknown_loc, mlir::TypeRange{c_tensor_type}, a, b, init_condition, real_m,
+      real_k, real_n, c_tensor, per_channel_bias, a_transpose, b_transpose,
+      enable_HF32);
+  var_map_[npuirop.dst->data.get()] = mma->getResult(0);
 }
 
 void CodeGenTileLangNPUIRAPIA5::BitcastCodegen(const CallNode *op) {
